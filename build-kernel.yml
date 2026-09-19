@@ -1,0 +1,103 @@
+# Simpan sebagai: .github/workflows/build-kernel.yml
+# Jalankan dari tab Actions -> "Build Kernel courbet" -> Run workflow
+
+name: Build Kernel courbet
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "URL repo kernel source"
+        default: "https://github.com/MiCode/Xiaomi_Kernel_OpenSource"
+      kernel_branch:
+        description: "Branch kernel"
+        default: "courbet-r-oss"
+      defconfig:
+        description: "Defconfig (path relatif dari arch/arm64/configs/)"
+        default: "vendor/courbet_defconfig"
+      enable_ksu:
+        description: "Integrasikan KernelSU Next"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Install dependensi
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev \
+            cpio zip lz4 python3 git curl device-tree-compiler
+
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 --single-branch \
+            -b "${{ inputs.kernel_branch }}" \
+            "${{ inputs.kernel_repo }}" kernel
+
+      - name: Clone toolchain (Proton Clang)
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
+          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Cek defconfig yang tersedia
+        working-directory: kernel
+        run: |
+          echo "Defconfig courbet yang ditemukan:"
+          find arch/arm64/configs -name "*courbet*"
+
+      - name: Integrasi KernelSU Next
+        if: ${{ inputs.enable_ksu }}
+        working-directory: kernel
+        run: |
+          # Cek README KernelSU Next untuk perintah setup terbaru
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          # Kernel 4.19 non-GKI: butuh kprobes
+          {
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KPROBES=y"
+            echo "CONFIG_HAVE_KPROBES=y"
+            echo "CONFIG_KPROBE_EVENTS=y"
+          } >> "arch/arm64/configs/${{ inputs.defconfig }}"
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          ARGS="O=out ARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          make $ARGS "${{ inputs.defconfig }}"
+          make $ARGS -j"$(nproc)" 2>&1 | tee ../build.log
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          cd ak3
+          rm -rf .git README.md
+          sed -i 's|^kernel.string=.*|kernel.string=Custom Kernel courbet by Adrik|' anykernel.sh
+          sed -i 's|^do.devicecheck=.*|do.devicecheck=1|' anykernel.sh
+          sed -i 's|^device.name1=.*|device.name1=courbet|' anykernel.sh
+          sed -i 's|^is_slot_device=.*|is_slot_device=auto;|' anykernel.sh
+          sed -i 's|^block=.*|block=auto;|' anykernel.sh
+          OUT=../kernel/out/arch/arm64/boot
+          if [ -f "$OUT/Image.gz-dtb" ]; then
+            cp "$OUT/Image.gz-dtb" .
+          elif [ -f "$OUT/Image.gz" ]; then
+            cp "$OUT/Image.gz" .
+          else
+            cp "$OUT/Image" .
+          fi
+          zip -r9 "../courbet-kernel-$(date +%Y%m%d).zip" . -x '*.git*'
+
+      - name: Upload hasil
+        uses: actions/upload-artifact@v4
+        with:
+          name: courbet-kernel
+          path: |
+            courbet-kernel-*.zip
+            build.log
